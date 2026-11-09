@@ -1,0 +1,76 @@
+{
+  "name": "audio8",
+  "short_display_name": "Audio8",
+  "version": "0.6.2",
+  "description": "Audio8 TTS (unofficial) — 44.1kHz zero-shot voice cloning, runs on GPU in its own conda env",
+  "author": "sapphire",
+  "icon": "🎙️",
+  "priority": 50,
+  "default_enabled": false,
+  "pip_dependencies": [],
+  "environment": {
+    "python": "3.12",
+    "pip": [
+      "--extra-index-url=https://download.pytorch.org/whl/cu128",
+      "torch==2.11.0+cu128",
+      "torchaudio==2.11.0+cu128",
+      "transformers>=4.57,<5",
+      "soundfile>=0.12",
+      "safetensors>=0.4",
+      "pedalboard==0.9.26"
+    ]
+  },
+  "settingsUI": "plugin",
+  "capabilities": {
+    "providers": {
+      "tts": {
+        "key": "audio8",
+        "display_name": "Audio8 (Local, voice clone)",
+        "entry": "provider.py",
+        "class_name": "Audio8TTSProvider",
+        "is_local": true,
+        "description": "Zero-shot voice cloning on your GPU, runs here, free. Bring a short clip and its transcript."
+      }
+    },
+    "routes": [
+      {"method": "GET", "path": "voices", "handler": "routes/voices.py:list_voices"},
+      {"method": "POST", "path": "voices", "handler": "routes/voices.py:upload_voice"},
+      {"method": "GET", "path": "voices/{name}/audio", "handler": "routes/voices.py:voice_audio", "media": true},
+      {"method": "PUT", "path": "voices/{name}", "handler": "routes/voices.py:save_transcript"},
+      {"method": "DELETE", "path": "voices/{name}", "handler": "routes/voices.py:delete_voice"},
+      {"method": "POST", "path": "voices/{name}/transcribe", "handler": "routes/voices.py:transcribe_voice"},
+      {"method": "POST", "path": "voices/{name}/try", "handler": "routes/voices.py:try_voice"}
+    ],
+    "services": [
+      {
+        "name": "audio8-server",
+        "entry": "server.py",
+        "port": 5014,
+        "port_setting": "port"
+      }
+    ],
+    "settings": [
+      {
+        "key": "port",
+        "type": "number",
+        "label": "Server port",
+        "default": 5014,
+        "help": "Local port for the Audio8 model server. Change needs a plugin toggle to restart the service."
+      },
+      {
+        "key": "voice",
+        "type": "string",
+        "label": "Default voice",
+        "default": "sapphire",
+        "help": "Voice name: a built-in, or one you added (user/audio8-voices/<name>.wav + <name>.txt). Used when the chat's voice isn't an Audio8 voice."
+      },
+      {
+        "key": "temperature",
+        "type": "number",
+        "label": "Temperature",
+        "default": 0.8,
+        "help": "Sampling temperature. Lower = steadier, higher = livelier. Model default 0.8."
+      }
+    ]
+  }
+}

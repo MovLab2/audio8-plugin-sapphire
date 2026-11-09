@@ -1,0 +1,27 @@
+Audio8 TTS plugin for Sapphire
+Copyright 2026 The Sapphire Authors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Unofficial: not made or endorsed by Edge0. The model is downloaded from
+Hugging Face at run time and is not part of this plugin.
+
+fastgen.py drives the modules of audio8_tts by Edge0 (Apache License 2.0,
+https://huggingface.co/Edge0/Audio8-TTS-Realistic-Air, revision
+23c305cc013fde378edb459f538317043c993a74) at run time. Its decode loop is
+modelled on that model's generate() so that it decodes identically; any
+portions that follow that code are used under the Apache License 2.0.
+The audio8_tts NOTICE reads:
+
+    audio8_tts
+
+    The model architecture is inspired by the DualAR design used in Fish
+    Audio S2 Pro.
+
+The sampling (top-k and nucleus filtering, Gumbel-max sampling, and
+repetition-aware sampling from VALL-E 2) was written independently from
+the published methods.
+
+The built-in voice voices/sapphire.wav was generated with Kokoro-82M
+(https://huggingface.co/hexgrad/Kokoro-82M, voice af_heart), licensed
+under the Apache License, Version 2.0. The clip is synthetic speech, not a
+recording of any person.

@@ -1,7 +1,7 @@
 {
   "name": "audio8",
   "short_display_name": "Audio8",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Audio8 TTS (unofficial) — 44.1kHz zero-shot voice cloning, runs on GPU in its own conda env",
   "author": "sapphire",
   "icon": "🎙️",
@@ -33,6 +33,7 @@
       }
     },
     "routes": [
+      {"method": "GET", "path": "status", "handler": "routes/voices.py:server_status"},
       {"method": "GET", "path": "voices", "handler": "routes/voices.py:list_voices"},
       {"method": "POST", "path": "voices", "handler": "routes/voices.py:upload_voice"},
       {"method": "GET", "path": "voices/{name}/audio", "handler": "routes/voices.py:voice_audio", "media": true},
@@ -46,7 +47,8 @@
         "name": "audio8-server",
         "entry": "server.py",
         "port": 5014,
-        "port_setting": "port"
+        "port_setting": "port",
+        "health": "/health"
       }
     ],
     "settings": [

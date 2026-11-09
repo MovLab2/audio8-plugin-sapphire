@@ -56,9 +56,19 @@ VOICE_RE = re.compile(r"^[A-Za-z0-9_-]+$")  # blocks path traversal via voice na
 MAX_GROUP_CHARS = 300
 SPEED_MIN, SPEED_MAX = 0.75, 1.6   # the model follows a stretched reference well in this band
 PITCH_MIN, PITCH_MAX = 0.5, 2.0
-READY_TIMEOUT = 600  # first-ever load may download the model
+# A request during the load waits this long, then gets 503 with the phase:
+# a warm start (~15 s) still answers, a first-ever download says why it can't.
+READY_TIMEOUT = 60
+# What the model reads at MODEL_REV (the repo's badges and banner are skipped).
+# codec.pth is 1.3 GB that the model would otherwise fetch lazily on the first
+# request, AFTER saying ready (Prime, 2026-11-09).
+FILES = ("config.json", "generation_config.json", "configuration_arktts.py",
+         "modeling_arktts.py", "modeling_arktts_codec.py", "processing_arktts.py",
+         "preprocessor_config.json", "processor_config.json", "special_tokens_map.json",
+         "tokenizer.json", "tokenizer_config.json", "model.safetensors", "codec.pth")
 
-_state = {"status": "loading", "error": None, "engine": None}
+# /health. Core reads status/phase/progress/error (core/service_health.py).
+_state = {"status": "loading", "phase": "Starting", "progress": None, "error": None, "engine": None}
 _ready = threading.Event()
 _gpu_lock = threading.Lock()
 _model = None
@@ -70,24 +80,84 @@ _ref_lock = threading.Lock()
 _REF_CACHE_MAX = 32
 
 
+def _fetch():
+    """Download whatever of FILES isn't cached, its bytes counted into /health
+    by watching the hub's .incomplete blobs grow (any hub version; 0.36's
+    hf_hub_download takes no progress hook). All cached = no network at all."""
+    import glob
+    from huggingface_hub import HfApi, constants, hf_hub_download, try_to_load_from_cache
+    missing = [f for f in FILES
+               if not isinstance(try_to_load_from_cache(MODEL_ID, f, revision=MODEL_REV), str)]
+    if not missing:
+        return
+    info = HfApi().model_info(MODEL_ID, revision=MODEL_REV, files_metadata=True)
+    sizes = {s.rfilename: s.size or 0 for s in info.siblings}
+    total = sum(sizes.get(f, 0) for f in missing)
+    blobs = os.path.join(constants.HF_HUB_CACHE, "models--" + MODEL_ID.replace("/", "--"), "blobs")
+    state = {"base": 0, "on": True}
+
+    def count():
+        while state["on"]:
+            partial = 0
+            for path in glob.glob(os.path.join(blobs, "*.incomplete")):
+                try:
+                    partial += os.path.getsize(path)
+                except OSError:
+                    pass                          # finished between the glob and the stat
+            if big:
+                _state["progress"] = {"done": min(total, state["base"] + partial), "total": total}
+            threading.Event().wait(0.5)
+
+    big = total > 50e6
+    _state.update(phase=f"Downloading the model ({total / 1e9:.1f} GB, first start only)" if big
+                  else "Fetching model files", progress={"done": 0, "total": total} if big else None)
+    logger.info(f"downloading {len(missing)} file(s), {total / 1e9:.2f} GB")
+    counter = threading.Thread(target=count, daemon=True)
+    counter.start()
+    try:
+        for f in missing:
+            hf_hub_download(MODEL_ID, f, revision=MODEL_REV)
+            state["base"] += sizes.get(f, 0)
+    finally:
+        state["on"] = False
+        counter.join(2)
+        _state["progress"] = None
+
+
 def _load_model():
     global _model, _processor, _device
     try:
         import torch
+        try:
+            _fetch()
+        except Exception as e:      # offline with a usable cache: from_pretrained says if it isn't
+            logger.warning(f"model download check failed, loading from cache: {e!r}")
+            _state["progress"] = None
         from transformers import AutoModel, AutoProcessor
         _device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16 if _device == "cuda" else torch.float32
+        _state["phase"] = "Loading the model onto the GPU" if _device == "cuda" else "Loading the model (CPU)"
         logger.info(f"Loading {MODEL_ID}@{MODEL_REV[:8]} on {_device}")
         _processor = AutoProcessor.from_pretrained(
             MODEL_ID, revision=MODEL_REV, trust_remote_code=True)
         _model = AutoModel.from_pretrained(
             MODEL_ID, revision=MODEL_REV, trust_remote_code=True, dtype=dtype
         ).eval().to(_device)
+        _state["phase"] = "Warming up the engine (first start compiles, about a minute)"
         _warm_engine()
-        _state["status"] = "ready"
+        # One real line end to end: reference encode, decode, codec. Ready
+        # then means the next request does no first-time work.
+        _state["phase"] = "Warming up the voice"
+        try:
+            warm = _render("Ready.", "sapphire", 0.8)
+        except ValueError:                       # a user 'sapphire' without its transcript
+            warm = _render("Ready.", None, 0.8)
+        for _ in warm:
+            pass
+        _state.update(status="ready", phase="Ready")
         logger.info(f"Model ready (engine: {_state['engine']})")
     except Exception as e:
-        _state.update(status="error", error=str(e))
+        _state.update(status="error", phase="Failed", progress=None, error=str(e) or type(e).__name__)
         logger.error(f"Model load failed: {e!r}")
     finally:
         _ready.set()
@@ -318,7 +388,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "empty text"})
             return
         if not _ready.wait(timeout=READY_TIMEOUT) or _state["status"] != "ready":
-            self._json(503, {"error": f"model not ready: {_state}"})
+            why = _state["error"] if _state["status"] == "error" else _state["phase"]
+            self._json(503, {"error": f"Audio8 isn't ready: {why}"})
             return
         temperature = _clamp(data.get("temperature") or 0.8, 0.05, 2.0, 0.8)
         speed = _clamp(data.get("speed", 1.0), SPEED_MIN, SPEED_MAX)

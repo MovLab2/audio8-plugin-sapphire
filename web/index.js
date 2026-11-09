@@ -43,6 +43,9 @@ function injectStyles() {
         .a8-spacer { flex: 1; }
         .a8-hint.err { color: var(--error); }
         .a8 [hidden] { display: none !important; }
+        .a8-status { display: flex; flex-direction: column; gap: 6px; border-color: var(--warning); }
+        .a8-status.err { border-color: var(--error); }
+        .a8-status progress { width: 100%; height: 8px; }
     `;
     document.head.appendChild(s);
 }
@@ -56,6 +59,42 @@ function json(method, body) {
 }
 
 let lib = { voices: [], stt: {} };
+let ready = false;              // the model server answers; Speak and Try wait for it
+
+// Speak and Try stay off until the server says ready (it can take minutes on
+// a first start: the model downloads and compiles).
+function applyReady(box) {
+    box.querySelectorAll('#a8-s-go, [data-act="try"]').forEach(b => {
+        if (!b.dataset.busy) b.disabled = !ready;
+    });
+}
+
+async function watchStatus(box) {
+    const el = box.querySelector('#a8-status');
+    const me = box._a8watch = {};             // a re-render starts a new watch; this one bows out
+    while (box.isConnected && box._a8watch === me) {
+        let st;
+        try { st = await api('/api/plugin/audio8/status', {}, 5000); }
+        catch { st = { status: 'down', phase: 'No answer from Sapphire' }; }
+        ready = st.status === 'ready';
+        applyReady(box);
+        el.hidden = ready;
+        if (ready) {                          // keep an eye out: a crash restarts it
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+        }
+        const p = st.progress, bar = el.querySelector('progress');
+        el.classList.toggle('err', st.status === 'error');
+        el.querySelector('.a8-name').textContent = st.status === 'error'
+            ? 'Audio8 failed to start' : 'Audio8 is starting';
+        el.querySelector('.a8-hint').textContent = st.status === 'error'
+            ? `${st.error || 'see user/logs/audio8-audio8-server.log'}`
+            : `${st.phase || 'Starting'}${p?.total ? ` - ${(p.done / 1e9).toFixed(2)} of ${(p.total / 1e9).toFixed(2)} GB` : ''}. Speak and Try turn on when it is ready.`;
+        bar.hidden = !p?.total;
+        if (p?.total) { bar.max = p.total; bar.value = p.done; }
+        await new Promise(r => setTimeout(r, st.status === 'error' ? 5000 : 1500));
+    }
+}
 
 function renderGeneral(box, settings) {
     const g = box.querySelector('#a8-general');
@@ -103,7 +142,7 @@ function wireSampler(box) {
         const voice = $('#a8-s-voice').value;
         if (!voice) { flash('Add a voice with a transcript first', 'warning'); return; }
         if (!text.value.trim()) { flash('Type something for the voice to say', 'warning'); text.focus(); return; }
-        go.disabled = true; go.textContent = 'Speaking...';
+        go.disabled = true; go.dataset.busy = '1'; go.textContent = 'Speaking...';
         try {
             const blob = await api(vurl(voice, '/try'), json('POST', {
                 text: text.value, format: 'mp3',
@@ -116,7 +155,7 @@ function wireSampler(box) {
             dl.disabled = false;
             player.play().catch(() => {});
         } catch (e) { flash(errWords(e), 'error'); }
-        go.disabled = false; go.textContent = 'Speak';
+        delete go.dataset.busy; go.disabled = !ready; go.textContent = 'Speak';
     };
     go.addEventListener('click', speak);
     text.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); speak(); } });
@@ -163,14 +202,14 @@ function card(v, box) {
 
     btn('try').addEventListener('click', async () => {
         const b = btn('try');
-        b.disabled = true; b.textContent = 'Speaking...';
+        b.disabled = true; b.dataset.busy = '1'; b.textContent = 'Speaking...';
         try {
             const blob = await api(vurl(v.name, '/try'), json('POST', {}));
             const a = new Audio(URL.createObjectURL(blob));
             a.addEventListener('ended', () => URL.revokeObjectURL(a.src));
             await a.play();
         } catch (e) { flash(errWords(e), 'error'); }
-        b.disabled = false; b.textContent = 'Try it';
+        delete b.dataset.busy; b.disabled = !ready; b.textContent = 'Try it';
     });
 
     btn('stt')?.addEventListener('click', async () => {
@@ -220,6 +259,7 @@ function renderLibrary(box) {
     list.innerHTML = '';
     lib.voices.forEach(v => list.appendChild(card(v, box)));
     fillVoiceSelect(box);
+    applyReady(box);
 }
 
 async function loadLibrary(box) {
@@ -378,6 +418,11 @@ export default {
             render(container, settings) {
                 container.innerHTML = `
                     <div class="a8">
+                        <section class="a8-card a8-status" id="a8-status">
+                            <div class="a8-name">Checking Audio8...</div>
+                            <div class="a8-hint"></div>
+                            <progress hidden></progress>
+                        </section>
                         <section class="a8-card">
                             <h4>Sampler</h4>
                             <div class="a8-row">
@@ -422,6 +467,7 @@ export default {
                 wireUpload(container);
                 wireSampler(container);
                 loadLibrary(container);
+                watchStatus(container);
             },
 
             load: () => pluginsAPI.getSettings('audio8'),

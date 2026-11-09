@@ -242,6 +242,18 @@ def _num(value, lo, hi):
     return max(lo, min(hi, v)) if v == v else 1.0
 
 
+def server_status(settings=None, **_):
+    """The model server's /health for the page: status, phase, progress, error.
+    status "down" = no answer (plugin off, or the process starting)."""
+    from core import net
+    try:
+        port = int((settings or {}).get("port") or 5014)
+        h = net.get(f"http://127.0.0.1:{port}/health", timeout=2).json()
+    except Exception:
+        return {"status": "down", "phase": "Starting the server", "progress": None, "error": None}
+    return {k: h.get(k) for k in ("status", "phase", "progress", "error")}
+
+
 def try_voice(name, body=None, settings=None, **_):
     """Speak text with this voice. Body {text?, speed?, pitch?, format?}:
     no text = a stock test line; format "mp3" = a file to download and share,
@@ -270,7 +282,11 @@ def try_voice(name, body=None, settings=None, **_):
     except Exception:
         return {"error": "The Audio8 server isn't answering. Is the plugin on and loaded?"}, 503
     if r.status_code != 200:
-        return {"error": (r.text or "The Audio8 server refused.")[:200]}, r.status_code
+        try:
+            words = r.json().get("error")
+        except Exception:
+            words = r.text
+        return {"error": str(words or "The Audio8 server refused.")[:300]}, r.status_code
     if mp3:
         return Response(_mp3(r.content), media_type="audio/mpeg")
     return Response(r.content, media_type="audio/ogg")

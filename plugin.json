@@ -1,7 +1,7 @@
 {
   "name": "audio8",
   "short_display_name": "Audio8",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Audio8 TTS (unofficial) — 44.1kHz zero-shot voice cloning, runs on GPU in its own conda env",
   "author": "sapphire",
   "icon": "🎙️",

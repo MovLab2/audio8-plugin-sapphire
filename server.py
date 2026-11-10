@@ -52,6 +52,9 @@ BUILTIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
 _CACHE = os.path.join(ROOT, "user", "models", "audio8")
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE, "inductor"))
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_CACHE, "triton"))
+# Grow and give back VRAM in pages instead of caching every odd-sized block
+# a decode ever asked for (reserved ran 7 GB for a 4.4 GB peak).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 VOICE_RE = re.compile(r"^[A-Za-z0-9_-]+$")  # blocks path traversal via voice name
 MAX_GROUP_CHARS = 300
 SPEED_MIN, SPEED_MAX = 0.75, 1.6   # the model follows a stretched reference well in this band
@@ -219,6 +222,38 @@ def _codes(inputs, temperature):
     return out.codes
 
 
+# The codec's conv decoder runs in pieces of DECODE_CHUNK latent steps (512
+# samples each, ~3 s) with DECODE_CTX steps of lead-in: in strict fp32, 64
+# matches a whole decode exactly (16 is 96 dB, 4 is audible).
+DECODE_CHUNK, DECODE_CTX = 256, 64
+
+
+def _decode(codes):
+    """Codes [1, codebooks, T] -> float32 audio (on the codec's device).
+
+    The memory of a decode is the conv decoder working at audio rate: about
+    1 GB per 20 s of speech, 4.4 GB peak for a full 1024-frame group. Its
+    transformer runs whole (it looks back ~1000 frames: chunking it is
+    audible); the convs run in ~3 s pieces, so peak VRAM stays flat at any
+    length, and the pieces run a little faster than one big pass. Same
+    samples as a whole decode, to float rounding (2026-11-10)."""
+    import torch
+    codec = _model.load_codec(device=codes.device)
+    item = codes[0]
+    n = int((item >= 0).all(dim=0).sum().item())
+    if n == 0:
+        return torch.empty(0, device=codes.device)
+    with torch.inference_mode():
+        latent = codec.quantizer.decode(item[:, :n].unsqueeze(0).long())
+        hop = codec.hop_length
+        out = []
+        for s in range(0, latent.shape[-1], DECODE_CHUNK):
+            a = max(0, s - DECODE_CTX)
+            wav = codec.decoder(latent[..., a:s + DECODE_CHUNK])[0, 0].float()
+            out.append(wav[(s - a) * hop:])
+        return torch.cat(out)
+
+
 def _resolve_voice(name):
     """Return (wav_path, transcript) or (None, None) for base voice."""
     if not name or not VOICE_RE.match(name):
@@ -318,8 +353,7 @@ def _render(text, voice, temperature, speed=1.0, pitch=1.0):
                 inputs = _processor(**kwargs)
                 inputs = {k: v.to(_device) for k, v in inputs.items()}
                 with torch.inference_mode():
-                    waveforms, lengths = _model.decode_audio(_codes(inputs, temperature))
-                audio = waveforms[0, : int(lengths[0])].float().cpu().numpy()
+                    audio = _decode(_codes(inputs, temperature)).cpu().numpy()
                 yield np.concatenate([gap, audio]) if n else audio
     return groups()
 

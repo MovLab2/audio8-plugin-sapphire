@@ -114,7 +114,11 @@ function renderGeneral(box, settings) {
                 <input type="number" id="a8-port" min="1024" max="65535" value="${Number(settings.port ?? 5014)}">
             </div>
         </div>
-        <div class="a8-hint">Temperature: lower is steadier, higher is livelier (model default 0.8). A port change needs a plugin toggle.</div>`;
+        <div class="a8-hint">Temperature: lower is steadier, higher is livelier (model default 0.8). A port change needs a plugin toggle.</div>
+        <div class="a8-field">
+            <label><input type="checkbox" id="a8-pieces" ${settings.pieces === true ? 'checked' : ''}> Stream in pieces (experimental)</label>
+            <div class="a8-hint">Off is recommended. On sends speech in short pieces as it's made: first words come sooner, but it costs more GPU time and adds small gaps between pieces.</div>
+        </div>`;
     g.dataset.voice = settings.voice || 'sapphire';
 }
 
@@ -479,6 +483,7 @@ export default {
                     voice: container.querySelector('#a8-voice').value || 'sapphire',
                     temperature: num('#a8-temp', 0.8),
                     port: Math.round(num('#a8-port', 5014)),
+                    pieces: container.querySelector('#a8-pieces').checked,
                 };
             },
         });

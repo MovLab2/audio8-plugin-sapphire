@@ -1,7 +1,7 @@
 {
   "name": "audio8",
   "short_display_name": "Audio8",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "description": "Audio8 TTS (unofficial) — 44.1kHz zero-shot voice cloning, runs on GPU in its own conda env",
   "author": "sapphire",
   "icon": "🎙️",
@@ -72,6 +72,13 @@
         "label": "Temperature",
         "default": 0.8,
         "help": "Sampling temperature. Lower = steadier, higher = livelier. Model default 0.8."
+      },
+      {
+        "key": "pieces",
+        "type": "boolean",
+        "label": "Stream in pieces (experimental)",
+        "default": false,
+        "help": "Off (recommended): each sentence group comes whole. On: speech is sent in short pieces as it's made, so the first words come sooner, but it costs more GPU time and adds small gaps between pieces."
       }
     ]
   }

@@ -283,19 +283,33 @@ def _decode(codes, start=0):
 # by SEG_MAX s it ends at the quietest 20 ms past SEG_MIN.
 STEP = 12                     # frames between incremental decodes (~0.56 s)
 SEG_MIN, SEG_MAX, PAUSE_S = 1.5, 6.0, 0.16
-# After the first segment a stream's frames are paced to PACE_RATE x realtime,
-# so the GPU is shared smoothly instead of in one burst (2026-11-10, a probe
-# needing 20 of every 33 ms: a burst made it miss 85 of 86 frames, paced 2x
-# none). With under PACE_MIN s of sent audio queued ahead it runs full speed.
-PACE_RATE, PACE_MIN = 1.5, 1.5
+# Frames are paced to PACE_RATE x realtime so the GPU is shared smoothly
+# instead of in one burst (2026-11-10, a probe needing 20 of every 33 ms: a
+# burst made it miss 85 of 86 frames, paced 2x none), but only with PACE_LEAD
+# s of sent audio queued ahead of playback: a segment waits for a pause, up to
+# SEG_MAX s, and must still land before the queue runs dry (0.8.0 paced from
+# 1.5 s and stuttered on a 5060 Ti beside an avatar). A GPU that can't beat
+# PACE_RATE comfortably is never paced.
+PACE_RATE, PACE_LEAD = 1.5, 6.0
 FRAME_S = 2048 / 44100
 
 
 class _Pacer:
-    """One stream's clock: playback is taken to start at its first segment."""
+    """One stream's clock (playback taken to start at its first segment) and
+    this GPU's measured speed, sleeps left out (`speed`, x realtime)."""
 
     def __init__(self, on):
         self.on, self.t0, self.sent, self.tick = on, None, 0.0, time.monotonic()
+        self.per = None               # seconds of compute per frame, smoothed
+
+    @property
+    def speed(self):
+        return FRAME_S / self.per if self.per else 1.0
+
+    def first_min(self):
+        """Seconds the first segment must hold: enough to cover making the
+        next one (up to SEG_MIN + SEG_MAX s) at this GPU's speed."""
+        return min(8.0, max(SEG_MIN, (SEG_MIN + SEG_MAX) / self.speed + 0.5))
 
     def sent_audio(self, seconds):
         if self.t0 is None:
@@ -304,22 +318,25 @@ class _Pacer:
 
     def frame(self):
         now = time.monotonic()
-        if self.on and self.t0 is not None and self.sent - (now - self.t0) > PACE_MIN:
-            wait = FRAME_S / PACE_RATE - (now - self.tick)
+        dt = now - self.tick
+        self.per = dt if self.per is None else 0.9 * self.per + 0.1 * dt
+        if (self.on and self.t0 is not None and self.speed > PACE_RATE * 1.3
+                and self.sent - (now - self.t0) > PACE_LEAD):
+            wait = FRAME_S / PACE_RATE - dt
             if wait > 0:
                 time.sleep(wait)
                 now = time.monotonic()
         self.tick = now
 
 
-def _cut(audio, sr):
+def _cut(audio, sr, min_s=SEG_MIN):
     """Sample index to end a segment at, or None to wait for more: the middle
-    of the last pause past SEG_MIN (PAUSE_S of 20 ms windows under 5% of the
-    loudest), or past SEG_MAX the quietest window past SEG_MIN."""
+    of the last pause past min_s (PAUSE_S of 20 ms windows under 5% of the
+    loudest), or past min_s + SEG_MAX the quietest window past min_s."""
     import numpy as np
     win = sr // 50
     n = len(audio) // win
-    lo = int(SEG_MIN * 50)
+    lo = int(min_s * 50)
     if n <= lo:
         return None
     rms = np.sqrt((audio[:n * win].reshape(n, win) ** 2).mean(axis=1))
@@ -333,7 +350,7 @@ def _cut(audio, sr):
         if run >= PAUSE_S * 50 and mid >= lo:
             best = mid
         run = 0
-    if best is None and n >= SEG_MAX * 50:
+    if best is None and n >= lo + SEG_MAX * 50:
         best = lo + int(np.argmin(rms[lo:]))
     return None if best is None else best * win + win // 2
 
@@ -363,7 +380,7 @@ def _segments(inputs, temperature, pacer):
         if len(frames) - done >= STEP:
             new = _decode(torch.stack(frames, dim=2), start=done).cpu().numpy()
             pending, done = np.concatenate([pending, new]), len(frames)
-            cut = _cut(pending, sr)
+            cut = _cut(pending, sr, SEG_MIN if pacer.t0 is not None else pacer.first_min())
             if cut:
                 yield pending[:cut]
                 pending = pending[cut:]
@@ -578,7 +595,8 @@ class Handler(BaseHTTPRequestHandler):
         speed = _clamp(data.get("speed", 1.0), SPEED_MIN, SPEED_MAX)
         pitch = _clamp(data.get("pitch", 1.0), PITCH_MIN, PITCH_MAX)
         if self.path == "/tts/stream":
-            self._stream(text, data.get("voice"), temperature, speed, pitch)
+            self._stream(text, data.get("voice"), temperature, speed, pitch,
+                         pieces=data.get("pieces") is True)
             return
         try:
             fmt = "wav" if data.get("format") == "wav" else "ogg"
@@ -597,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(audio)
 
-    def _stream(self, text, voice, temperature, speed, pitch):
+    def _stream(self, text, voice, temperature, speed, pitch, pieces=False):
         """One complete OGG per segment (a pause-cut piece of a group on the
         fast engine, else a whole group), written the moment it's made
         (Kokoro's /tts/stream shape; the provider splits files at EOS pages).
@@ -605,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
         requests' iter_content wait for the END before yielding anything.
         A failure after the 200 can only end the body early."""
         try:
-            groups = _render(text, voice, temperature, speed, pitch, stream=True)
+            groups = _render(text, voice, temperature, speed, pitch, stream=pieces)
         except ValueError as e:
             logger.error(str(e))
             self._json(400, {"error": str(e)})

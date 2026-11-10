@@ -91,6 +91,7 @@ class Audio8TTSProvider(BaseTTSProvider):
         except (TypeError, ValueError):
             temperature = 0.8
         return {"text": text, "voice": name, "temperature": temperature,
+                "pieces": _settings().get("pieces") is True,
                 "speed": max(self.SPEED_MIN, min(self.SPEED_MAX, float(speed or 1.0))),
                 "pitch": float(kwargs.get("pitch") or 1.0)}
 

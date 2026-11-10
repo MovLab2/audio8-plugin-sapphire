@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import threading
+import time
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
@@ -242,8 +243,10 @@ LEAD = 8
 DECODE_CHUNK, DECODE_CTX = 256, 64
 
 
-def _decode(codes):
-    """Codes [1, codebooks, T] -> float32 audio (on the codec's device).
+def _decode(codes, start=0):
+    """Codes [1, codebooks, T] -> float32 audio (on the codec's device), from
+    frame `start` on: the codec is causal, so the audio of frames before
+    `start` is skipped without changing what follows.
 
     The memory of a decode is the conv decoder working at audio rate: about
     1 GB per 20 s of speech, 4.4 GB peak for a full 1024-frame group. Its
@@ -265,12 +268,110 @@ def _decode(codes):
             _lead = codec.encode(quiet)[0][0, :, -LEAD:].long()
         latent = codec.quantizer.decode(torch.cat((_lead, item[:, :n].long()), dim=-1).unsqueeze(0))
         hop = codec.hop_length
+        per = codec.frame_length // hop               # latent steps per frame
         out = []
-        for s in range(0, latent.shape[-1], DECODE_CHUNK):
+        for s in range((LEAD + start) * per, latent.shape[-1], DECODE_CHUNK):
             a = max(0, s - DECODE_CTX)
             wav = codec.decoder(latent[..., a:s + DECODE_CHUNK])[0, 0].float()
             out.append(wav[(s - a) * hop:])
-        return torch.cat(out)[LEAD * codec.frame_length:]
+        return torch.cat(out) if out else torch.empty(0, device=codes.device)
+
+
+# /tts/stream sends each group as several OGGs while it decodes, each cut in
+# a pause the model left: the browser starts every segment with a ~20-50 ms
+# gap, heard only mid-word. A segment runs SEG_MIN s at least; with no pause
+# by SEG_MAX s it ends at the quietest 20 ms past SEG_MIN.
+STEP = 12                     # frames between incremental decodes (~0.56 s)
+SEG_MIN, SEG_MAX, PAUSE_S = 1.5, 6.0, 0.16
+# After the first segment a stream's frames are paced to PACE_RATE x realtime,
+# so the GPU is shared smoothly instead of in one burst (2026-11-10, a probe
+# needing 20 of every 33 ms: a burst made it miss 85 of 86 frames, paced 2x
+# none). With under PACE_MIN s of sent audio queued ahead it runs full speed.
+PACE_RATE, PACE_MIN = 1.5, 1.5
+FRAME_S = 2048 / 44100
+
+
+class _Pacer:
+    """One stream's clock: playback is taken to start at its first segment."""
+
+    def __init__(self, on):
+        self.on, self.t0, self.sent, self.tick = on, None, 0.0, time.monotonic()
+
+    def sent_audio(self, seconds):
+        if self.t0 is None:
+            self.t0 = time.monotonic()
+        self.sent += seconds
+
+    def frame(self):
+        now = time.monotonic()
+        if self.on and self.t0 is not None and self.sent - (now - self.t0) > PACE_MIN:
+            wait = FRAME_S / PACE_RATE - (now - self.tick)
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+        self.tick = now
+
+
+def _cut(audio, sr):
+    """Sample index to end a segment at, or None to wait for more: the middle
+    of the last pause past SEG_MIN (PAUSE_S of 20 ms windows under 5% of the
+    loudest), or past SEG_MAX the quietest window past SEG_MIN."""
+    import numpy as np
+    win = sr // 50
+    n = len(audio) // win
+    lo = int(SEG_MIN * 50)
+    if n <= lo:
+        return None
+    rms = np.sqrt((audio[:n * win].reshape(n, win) ** 2).mean(axis=1))
+    quiet = rms < max(0.003, 0.05 * rms.max())
+    best, run = None, 0
+    for i in range(n + 1):
+        if i < n and quiet[i]:
+            run += 1
+            continue
+        mid = i - run + run // 2
+        if run >= PAUSE_S * 50 and mid >= lo:
+            best = mid
+        run = 0
+    if best is None and n >= SEG_MAX * 50:
+        best = lo + int(np.argmin(rms[lo:]))
+    return None if best is None else best * win + win // 2
+
+
+def _segments(inputs, temperature, pacer):
+    """One group's audio in segments cut at pauses while it decodes. Each
+    step decodes the codes so far from the last decoded frame on: the same
+    samples as one whole decode (fp32, 2026-11-10)."""
+    import numpy as np
+    import torch
+    sr = _model.config.codec_sample_rate
+    frames, done, pending = [], 0, np.zeros(0, dtype="float32")
+    it = _fast.stream(inputs, max_new_tokens=1024, temperature=temperature, top_p=0.95)
+    while True:
+        try:
+            f = next(it)
+        except StopIteration:
+            break
+        except Exception as e:
+            _demote(e)
+            if frames:
+                raise
+            yield _decode(_codes(inputs, temperature)).cpu().numpy()
+            return
+        frames.append(f)
+        pacer.frame()
+        if len(frames) - done >= STEP:
+            new = _decode(torch.stack(frames, dim=2), start=done).cpu().numpy()
+            pending, done = np.concatenate([pending, new]), len(frames)
+            cut = _cut(pending, sr)
+            if cut:
+                yield pending[:cut]
+                pending = pending[cut:]
+    if len(frames) > done:
+        new = _decode(torch.stack(frames, dim=2), start=done).cpu().numpy()
+        pending = np.concatenate([pending, new])
+    if len(pending):
+        yield pending
 
 
 def _ref_codes(inputs, key):
@@ -364,9 +465,11 @@ def _split_text(text):
     return groups or [text]
 
 
-def _render(text, voice, temperature, speed=1.0, pitch=1.0):
+def _render(text, voice, temperature, speed=1.0, pitch=1.0, stream=False):
     """Yield float32 audio per sentence group (~MAX_GROUP_CHARS), at the codec
-    rate, each group after the first led by a short breath gap. Voice and
+    rate, each group after the first led by a short breath gap. stream=True
+    (on the fast engine) yields each group in paced segments as it decodes
+    (_segments, _Pacer). Voice and
     reference problems raise ValueError BEFORE the first yield, so a caller
     can still answer 400. The GPU lock spans the whole request: one text's
     groups never interleave with another request's."""
@@ -391,8 +494,16 @@ def _render(text, voice, temperature, speed=1.0, pitch=1.0):
                 if ref_key and "reference_audio_values" in inputs:
                     inputs = _ref_codes(inputs, ref_key)
                 with torch.inference_mode():
-                    audio = _decode(_codes(inputs, temperature)).cpu().numpy()
-                yield np.concatenate([gap, audio]) if n else audio
+                    if stream and _fast is not None:
+                        parts = _segments(inputs, temperature, pacer)
+                    else:
+                        parts = iter([_decode(_codes(inputs, temperature)).cpu().numpy()])
+                    for i, audio in enumerate(parts):
+                        if n and not i:
+                            audio = np.concatenate([gap, audio])
+                        pacer.sent_audio(len(audio) / sr)
+                        yield audio
+    pacer = _Pacer(stream)
     return groups()
 
 
@@ -487,13 +598,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(audio)
 
     def _stream(self, text, voice, temperature, speed, pitch):
-        """One complete OGG per sentence group, written the moment it's made
+        """One complete OGG per segment (a pause-cut piece of a group on the
+        fast engine, else a whole group), written the moment it's made
         (Kokoro's /tts/stream shape; the provider splits files at EOS pages).
         Chunked transfer, one HTTP chunk per OGG: a close-delimited body made
         requests' iter_content wait for the END before yielding anything.
         A failure after the 200 can only end the body early."""
         try:
-            groups = _render(text, voice, temperature, speed, pitch)
+            groups = _render(text, voice, temperature, speed, pitch, stream=True)
         except ValueError as e:
             logger.error(str(e))
             self._json(400, {"error": str(e)})

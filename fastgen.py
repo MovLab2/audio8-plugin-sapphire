@@ -176,6 +176,14 @@ class FastGen:
     def generate(self, inputs, max_new_tokens=1024, temperature=0.8, top_p=0.95, do_sample=True):
         """Codes [1, num_codebooks, T] for processor `inputs` (batch 1).
         The graph is captured sampling; greedy (parity checks) runs eager."""
+        frames = list(self.stream(inputs, max_new_tokens, temperature, top_p, do_sample))
+        if not frames:
+            return torch.empty((1, self.nc, 0), dtype=torch.long, device=self.dev)
+        return torch.stack(frames, dim=2)
+
+    @torch.inference_mode()
+    def stream(self, inputs, max_new_tokens=1024, temperature=0.8, top_p=0.95, do_sample=True):
+        """Each frame's codes [1, num_codebooks] as it decodes, until EOS."""
         if self.use_graph and not do_sample:
             raise ValueError("the graph is captured for sampling; greedy runs eager")
         m = self.m
@@ -199,15 +207,11 @@ class FastGen:
         self.first.fill_(True)
         if self.use_graph and self.graph is None:
             self._capture()
-        frames = []
         for _ in range(min(max_new_tokens, self.L - W)):
             if self.use_graph:
                 self.graph.replay()
             else:
                 self._frame()
             if int(self.out_sem.item()) == self.eos:
-                break
-            frames.append(self.out_codes.clone())
-        if not frames:
-            return torch.empty((1, self.nc, 0), dtype=torch.long, device=self.dev)
-        return torch.stack(frames, dim=2)
+                return
+            yield self.out_codes.clone()

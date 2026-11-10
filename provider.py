@@ -95,9 +95,9 @@ class Audio8TTSProvider(BaseTTSProvider):
                 "pitch": float(kwargs.get("pitch") or 1.0)}
 
     def generate_stream(self, text: str, voice: str, speed: float, **kwargs) -> Iterator[bytes]:
-        """Yield one OGG per sentence group as the server makes it, so the
-        first audio comes after ~300 chars instead of the whole chunk and the
-        pump sees steady progress. Falls back to one blob on a server error
+        """Yield each OGG segment as the server makes it (cut at pauses, about
+        every 1.5-6 s of speech), so the first audio comes within a second
+        instead of after the whole chunk and the pump sees steady progress. Falls back to one blob on a server error
         before any audio; a 4xx (bad voice) would fail the same way, so not."""
         if not text or not text.strip():
             return

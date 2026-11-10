@@ -18,11 +18,12 @@ realtime on an RTX 5090 with the built-in fast engine (~2× on the model's own l
 ## Speed engine
 
 `fastgen.py` replays each decode frame as one CUDA graph, fused by
-`torch.compile` (~11x realtime on a 5090, vs ~2x for the model's own loop).
-The server picks the best engine that warms up, logged and shown in
-`/health` as `engine`: `compiled` -> `graph` (no Triton, e.g. Windows, ~5.7x)
--> `original`. Warm-up runs before the server reports ready: ~40s the first
-time, ~15s after (kernel cache in `user/models/audio8/`, never backed up).
+`torch.compile` with kernels autotuned for your GPU (~15x realtime on a 5090,
+vs ~2x for the model's own loop). The server picks the best engine that warms
+up, logged and shown in `/health` as `engine`: `tuned` -> `compiled` (~11x)
+-> `graph` (no Triton, e.g. Windows, ~5.7x) -> `original`. Warm-up runs
+before the server reports ready: a few minutes the first time (it tunes
+kernels on your card), ~20s after (kernel cache in `user/models/audio8/`, never backed up).
 After a model revision bump, run `tools/parity.py` with the env's python: it
 checks the fast loop still decodes like the model's own (greedy decoding
 identical, filter and RAS matching, sampler exact).

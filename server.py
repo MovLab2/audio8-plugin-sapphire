@@ -19,7 +19,8 @@ Opus resample. The base voice (no reference) has no speed control.
 
 Engine: fastgen.py replays each decode frame as one CUDA graph, fused by
 torch.compile when Triton works. Picked once at load, best rung first:
-compiled -> graph -> original model.generate; a rung that fails to warm up
+tuned (compile with kernels autotuned for this GPU) -> compiled -> graph ->
+original model.generate; a rung that fails to warm up
 drops to the next, and a runtime failure demotes to original for good.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -81,6 +82,8 @@ _fast = None               # FastGen, or None on the original engine
 _ref_cache = {}            # (wav, mtime, speed) -> {"array", "sampling_rate"}
 _ref_lock = threading.Lock()
 _REF_CACHE_MAX = 32
+_code_cache = {}           # (wav, mtime, speed) -> the reference's codec codes, encoded once
+_lead = None               # codec codes of silence, decoded ahead of each group
 
 
 def _fetch():
@@ -146,7 +149,7 @@ def _load_model():
         _model = AutoModel.from_pretrained(
             MODEL_ID, revision=MODEL_REV, trust_remote_code=True, dtype=dtype
         ).eval().to(_device)
-        _state["phase"] = "Warming up the engine (first start compiles, about a minute)"
+        _state["phase"] = "Warming up the engine (first start tunes for this GPU, a few minutes)"
         _warm_engine()
         # One real line end to end: reference encode, decode, codec. Ready
         # then means the next request does no first-time work.
@@ -180,12 +183,18 @@ def _warm_engine():
     warm = _processor(text=["Warming up."], return_tensors="pt")
     warm = {k: v.to(_device) for k, v in warm.items()}
     pristine = _model._setup_generation_caches
-    for name in ("compiled", "graph"):
+    # "tuned" benchmarks Triton kernels on this GPU for the frame's matmuls:
+    # ~38% less GPU time per frame than cuBLAS's bf16 gemv (2026-11-10, 5090),
+    # tuned once and cached under _CACHE. Its log shows "out of resource"
+    # lines for kernel configs too big for this card: those are skipped.
+    modes = {"tuned": "max-autotune-no-cudagraphs", "compiled": None}
+    for name in ("tuned", "compiled", "graph"):
         t = time.time()
         try:
             fg = FastGen(_model)
-            if name == "compiled":
-                fg._frame = torch.compile(fg._frame, dynamic=False)
+            if name in modes:
+                kw = {"mode": modes[name]} if modes[name] else {}
+                fg._frame = torch.compile(fg._frame, dynamic=False, **kw)
             fg.generate(warm, max_new_tokens=8)        # compile + capture
             fg.generate(warm, max_new_tokens=8)        # and a real replay
             _fast = fg
@@ -222,6 +231,11 @@ def _codes(inputs, temperature):
     return out.codes
 
 
+# Each group is decoded after LEAD frames of encoded silence, then those are
+# cut: a codec started cold wakes up mid-word (a hard click of an onset at
+# every group); seeded with silence it starts the way speech after a quiet
+# room does.
+LEAD = 8
 # The codec's conv decoder runs in pieces of DECODE_CHUNK latent steps (512
 # samples each, ~3 s) with DECODE_CTX steps of lead-in: in strict fp32, 64
 # matches a whole decode exactly (16 is 96 dB, 4 is audible).
@@ -237,6 +251,7 @@ def _decode(codes):
     audible); the convs run in ~3 s pieces, so peak VRAM stays flat at any
     length, and the pieces run a little faster than one big pass. Same
     samples as a whole decode, to float rounding (2026-11-10)."""
+    global _lead
     import torch
     codec = _model.load_codec(device=codes.device)
     item = codes[0]
@@ -244,14 +259,34 @@ def _decode(codes):
     if n == 0:
         return torch.empty(0, device=codes.device)
     with torch.inference_mode():
-        latent = codec.quantizer.decode(item[:, :n].unsqueeze(0).long())
+        if _lead is None or _lead.device != codes.device:
+            quiet = torch.zeros((1, 1, codec.frame_length * 40), device=codes.device,
+                                dtype=next(codec.parameters()).dtype)
+            _lead = codec.encode(quiet)[0][0, :, -LEAD:].long()
+        latent = codec.quantizer.decode(torch.cat((_lead, item[:, :n].long()), dim=-1).unsqueeze(0))
         hop = codec.hop_length
         out = []
         for s in range(0, latent.shape[-1], DECODE_CHUNK):
             a = max(0, s - DECODE_CTX)
             wav = codec.decoder(latent[..., a:s + DECODE_CHUNK])[0, 0].float()
             out.append(wav[(s - a) * hop:])
-        return torch.cat(out)
+        return torch.cat(out)[LEAD * codec.frame_length:]
+
+
+def _ref_codes(inputs, key):
+    """The processor's reference audio swapped for its codec codes, encoded
+    once per (clip, mtime, speed) instead of on every group of every request."""
+    with _ref_lock:
+        hit = _code_cache.get(key)
+    if hit is None:
+        hit = _model.encode_audio(inputs["reference_audio_values"], inputs["reference_audio_lengths"])
+        with _ref_lock:
+            if len(_code_cache) >= _REF_CACHE_MAX:
+                _code_cache.clear()
+            _code_cache[key] = hit
+    inputs = {k: v for k, v in inputs.items() if not k.startswith("reference_audio_")}
+    inputs["reference_codes"], inputs["reference_code_lengths"] = hit
+    return inputs
 
 
 def _resolve_voice(name):
@@ -340,6 +375,7 @@ def _render(text, voice, temperature, speed=1.0, pitch=1.0):
 
     wav_path, ref_text = _resolve_voice(voice)
     ref_audio = _reference(wav_path, speed) if wav_path else None
+    ref_key = (wav_path, os.path.getmtime(wav_path), round(speed * 20) / 20) if wav_path else None
     sr = _model.config.codec_sample_rate
     gap = np.zeros(int(0.12 * sr), dtype="float32")
 
@@ -352,6 +388,8 @@ def _render(text, voice, temperature, speed=1.0, pitch=1.0):
                     kwargs["reference_text"] = [ref_text]
                 inputs = _processor(**kwargs)
                 inputs = {k: v.to(_device) for k, v in inputs.items()}
+                if ref_key and "reference_audio_values" in inputs:
+                    inputs = _ref_codes(inputs, ref_key)
                 with torch.inference_mode():
                     audio = _decode(_codes(inputs, temperature)).cpu().numpy()
                 yield np.concatenate([gap, audio]) if n else audio

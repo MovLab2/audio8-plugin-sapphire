@@ -1,4 +1,5 @@
-"""Audio8 TTS provider — thin HTTP client for the plugin's model server.
+"""Audio8 TTS provider — thin HTTP client for the plugin's model server,
+this computer's or (Client only) another computer's (link.py).
 
 Loaded via exec() by the plugin loader (like piper), so imports are absolute
 and everything heavy lives in the service process (server.py, own conda env).
@@ -6,13 +7,13 @@ This side only needs requests + a directory scan.
 """
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Iterator, List, Optional
 
 import requests
 
-from core import net
-
+from plugins.audio8 import link
 from core.tts.providers.base import BaseTTSProvider
 import core.tts.providers.base as _base
 
@@ -50,16 +51,16 @@ class Audio8TTSProvider(BaseTTSProvider):
     # it (an unfair lock once let N+1 go first and N timed out, 2026-11-08).
     synth_workers = 1
 
-    def __init__(self):
-        logger.info("Audio8 TTS provider initialized")
-
     @property
-    def _base_url(self) -> str:
-        try:
-            port = int(_settings().get("port") or 5014)
-        except (TypeError, ValueError):
-            port = 5014
-        return f"http://127.0.0.1:{port}"
+    def remote(self) -> bool:
+        """Made on another computer (Client only): never on the GPU a face renders on."""
+        return bool(link.worker())
+
+    def __init__(self):
+        self._health_why = None     # why is_available() said no, in words (the provider switch shows it)
+        self._ok_at = 0.0           # when it last answered: one check per few seconds, not per speak
+        self._for = ""              # the pairing string _ok_at was for ("" = this computer)
+        logger.info("Audio8 TTS provider initialized")
 
     def _resolve_voice(self, voice: str) -> str:
         """Use the chat-passed voice only if it's one of our wavs (e.g. an
@@ -74,14 +75,13 @@ class Audio8TTSProvider(BaseTTSProvider):
             return None
         name = self._resolve_voice(voice)
         try:
-            r = net.post(f"{self._base_url}/tts", json=self._payload(text, name, speed, kwargs),
-                         timeout=300)
+            r = link.tts("/tts", self._payload(text, name, speed, kwargs), timeout=(5, 300))
             if r.status_code != 200:
                 detail = (r.text or "")[:200]
                 logger.error(f"[audio8] server {r.status_code} (voice={name}): {detail}")
                 return None
             return r.content or None
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError) as e:
             logger.error(f"[audio8] request failed (voice={name}): {e!r}")
             return None
 
@@ -107,11 +107,11 @@ class Audio8TTSProvider(BaseTTSProvider):
         sent = 0
         r = None
         try:
-            r = net.post(f"{self._base_url}/tts/stream", json=self._payload(text, name, speed, kwargs),
+            r = link.tts("/tts/stream", self._payload(text, name, speed, kwargs),
                          stream=True, timeout=(5, 300))
             if r.status_code != 200:
                 logger.error(f"[audio8] stream {r.status_code} (voice={name}): {(r.text or '')[:200]}")
-                if r.status_code >= 500:
+                if r.status_code >= 500 and r.status_code != 503:     # 503 = still starting: asking /tts waits it out again
                     audio = self.generate(text, voice, speed, **kwargs)
                     if audio:
                         yield audio
@@ -127,7 +127,7 @@ class Audio8TTSProvider(BaseTTSProvider):
             if buf:
                 sent += 1
                 yield buf
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError) as e:
             logger.error(f"[audio8] stream failed after {sent} segment(s) (voice={name}): {e!r}")
             if sent == 0:
                 audio = self.generate(text, voice, speed, **kwargs)
@@ -141,10 +141,37 @@ class Audio8TTSProvider(BaseTTSProvider):
 
     def is_available(self) -> bool:
         try:
-            r = net.get(f"{self._base_url}/health", timeout=2)
-            return r.status_code == 200 and r.json().get("status") != "error"
-        except Exception:
+            link.watch()                # the GPU computer's start, as a notification row
+        except Exception as e:          # a core before 2026-11-11 (no Watch fetch=): no row, nothing else lost
+            logger.debug(f"[audio8] no start row for the GPU computer: {e!r}")
+        if link.worker() != self._for:  # Client only flipped, or a new pairing: the last answer was someone else's
+            self._for, self._ok_at = link.worker(), 0.0
+        if time.monotonic() - self._ok_at < 10:
+            return True
+        try:
+            r = link.call("get", "/health", timeout=(5, 5))
+        except Exception as e:
+            self._health_why = link.words(e)
             return False
+        if r.status_code == 401:
+            self._health_why = link.REFUSED
+            return False
+        if r.status_code != 200:
+            self._health_why = f"HTTP {r.status_code}"
+            return False
+        try:
+            h = r.json()
+        except ValueError:
+            h = {}
+        if h.get("status") == "error":
+            self._health_why = f"Audio8 failed to start: {h.get('error') or 'see its window or log'}"
+            return False
+        if self.remote and h.get("status") != "ready":     # its first run downloads and compiles for minutes
+            self._health_why = f"Audio8 on the GPU computer is still starting: {h.get('phase') or h.get('status') or 'starting'}"
+            return False
+        self._health_why = None
+        self._ok_at = time.monotonic()
+        return True
 
     def list_voices(self) -> List[dict]:
         """One entry per wav in user/audio8-voices/ then the built-ins (a

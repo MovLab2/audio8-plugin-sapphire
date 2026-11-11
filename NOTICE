@@ -25,3 +25,7 @@ The built-in voice voices/sapphire.wav was generated with Kokoro-82M
 (https://huggingface.co/hexgrad/Kokoro-82M, voice af_heart), licensed
 under the Apache License, Version 2.0. The clip is synthetic speech, not a
 recording of any person.
+
+worker_door.py is a copy of Sapphire core/worker_door.py, offered for
+copies inside plugins under the MIT license by its author, Sapphire Blue
+AI LLC (see its header).

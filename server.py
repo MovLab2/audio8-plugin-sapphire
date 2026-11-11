@@ -22,16 +22,29 @@ torch.compile when Triton works. Picked once at load, best rung first:
 tuned (compile with kernels autotuned for this GPU) -> compiled -> graph ->
 original model.generate; a rung that fails to warm up
 drops to the next, and a runtime failure demotes to original for good.
+
+Shared GPU: run alone on another computer (audio8-server.sh / .bat), it
+also opens a TLS door (worker_door.py, a copy of Sapphire's) and prints a
+pairing string for the computer named "sapphire", the same on every start.
+A Sapphire in Client only mode sends each voice by the hash of its clip and
+transcript; an unknown hash gets 409 and the clip is sent once (POST /voice),
+kept in user/audio8-received/ (newest RECEIVED_MAX).
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import hashlib
 import io
 import json
 import logging
 import os
 import re
+import select
+import ssl
 import sys
 import threading
 import time
+
+import worker_door      # a copy of Sapphire's core/worker_door.py: this server also runs alone
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
@@ -49,6 +62,13 @@ ROOT = os.environ.get("SAPPHIRE_ROOT") or os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 VOICES_DIR = os.path.join(ROOT, "user", "audio8-voices")
 BUILTIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
+# Voices other computers sent, by hash, and the door's cert and keys.
+RECEIVED_DIR = os.path.join(ROOT, "user", "audio8-received")
+RECEIVED_MAX = 64
+DOOR = os.path.join(ROOT, "user", "worker_door", "audio8")
+HASH_RE = re.compile(r"^h-[0-9a-f]{64}$")
+MAX_VOICE_BYTES = 8 * 1024 * 1024        # a 30 s clip at 44.1 kHz is ~2.6 MB, base64 ~3.5
+_START = json.loads(os.environ.get("SAPPHIRE_PLUGIN_SETTINGS") or "{}")
 # torch.compile's kernel caches: rebuildable, so under user/models/ (never
 # backed up). Cold compile ~40s, warm ~15s; without a cache, every start pays 40.
 _CACHE = os.path.join(ROOT, "user", "models", "audio8")
@@ -163,6 +183,8 @@ def _load_model():
             pass
         _state.update(status="ready", phase="Ready")
         logger.info(f"Model ready (engine: {_state['engine']})")
+        if _banner:
+            print(_banner, flush=True)           # again: the load's logs scrolled the first one away
     except Exception as e:
         _state.update(status="error", phase="Failed", progress=None, error=str(e) or type(e).__name__)
         logger.error(f"Model load failed: {e!r}")
@@ -407,12 +429,36 @@ def _ref_codes(inputs, key):
     return inputs
 
 
+_banner = ""            # the pairing box, printed at the start and again when ready
+
+
+def _private(text):
+    """Words as another computer sees them: without this computer's folders or user name."""
+    text = str(text).replace(ROOT, "<audio8>")
+    home = os.path.expanduser("~")
+    return text.replace(home, "~") if len(home) > 1 else text
+
+
+class NeedVoice(LookupError):
+    """A hashed voice this computer hasn't been sent yet: answered 409."""
+
+
+def voice_hash(wav_bytes, transcript):
+    """The name a voice goes by between computers (provider computes the same)."""
+    return "h-" + hashlib.sha256(wav_bytes + b"\0" + transcript.strip().encode("utf-8")).hexdigest()
+
+
 def _resolve_voice(name):
     """Return (wav_path, transcript) or (None, None) for base voice."""
     if not name or not VOICE_RE.match(name):
         return None, None
-    folder = next((d for d in (VOICES_DIR, BUILTIN_DIR)
-                   if os.path.isfile(os.path.join(d, f"{name}.wav"))), None)
+    if HASH_RE.match(name):
+        if not all(os.path.isfile(os.path.join(RECEIVED_DIR, f"{name}{x}")) for x in (".wav", ".txt")):
+            raise NeedVoice(name)               # never sent, pruned, or mid-prune: sent again
+        dirs = (RECEIVED_DIR,)
+    else:
+        dirs = (VOICES_DIR, BUILTIN_DIR)
+    folder = next((d for d in dirs if os.path.isfile(os.path.join(d, f"{name}.wav"))), None)
     if folder is None:
         return None, None
     wav = os.path.join(folder, f"{name}.wav")
@@ -482,14 +528,16 @@ def _split_text(text):
     return groups or [text]
 
 
-def _render(text, voice, temperature, speed=1.0, pitch=1.0, stream=False):
+def _render(text, voice, temperature, speed=1.0, pitch=1.0, stream=False, wanted=None):
     """Yield float32 audio per sentence group (~MAX_GROUP_CHARS), at the codec
     rate, each group after the first led by a short breath gap. stream=True
     (on the fast engine) yields each group in paced segments as it decodes
     (_segments, _Pacer). Voice and
     reference problems raise ValueError BEFORE the first yield, so a caller
     can still answer 400. The GPU lock spans the whole request: one text's
-    groups never interleave with another request's."""
+    groups never interleave with another request's. `wanted()` False = the
+    caller left (a Stop): no group starts for nobody, nor the first one after
+    a wait for the lock."""
     import numpy as np
     import torch
 
@@ -502,6 +550,9 @@ def _render(text, voice, temperature, speed=1.0, pitch=1.0, stream=False):
     def groups():
         with _gpu_lock:
             for n, chunk in enumerate(_split_text(text)):
+                if wanted and not wanted():
+                    logger.info("the caller left: the rest of its text is not made")
+                    return
                 kwargs = {"text": [chunk], "return_tensors": "pt"}
                 if wav_path:
                     kwargs["reference_audio"] = [ref_audio]
@@ -560,6 +611,8 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug(fmt % args)
 
     def _json(self, code, obj):
+        if getattr(self.server, "door", None):
+            obj = {k: _private(v) if isinstance(v, str) else v for k, v in obj.items()}
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -567,21 +620,52 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _let_in(self):
+        """Through the shared door a request needs one of the door's keys
+        (refused and answered here); on 127.0.0.1 it's Sapphire's own call."""
+        if getattr(self.server, "door", None) and not worker_door.admit(self):
+            # Read the body first: closing with it unread resets the connection
+            # under the reply, and the caller never sees why.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if 0 < length <= MAX_VOICE_BYTES * 2:
+                self.rfile.read(length)
+            self.close_connection = True
+            self._json(401, {"error": "unauthorized"})
+            return False
+        return True
+
     def do_GET(self):
+        if not self._let_in():
+            return
         if self.path == "/health":
             self._json(200, _state)
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/tts", "/tts/stream"):
+        if not self._let_in():
+            return
+        door = getattr(self.server, "door", None)
+        if self.path not in ("/tts", "/tts/stream") and not (door and self.path == "/voice"):
             self._json(404, {"error": "not found"})
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length > MAX_VOICE_BYTES * 2:
+                self.close_connection = True
+                self._json(413, {"error": "too big"})
+                return
             data = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError
         except Exception:
             self._json(400, {"error": "bad json"})
+            return
+        if self.path == "/voice":
+            self._receive(data)
             return
         text = (data.get("text") or "").strip()
         if not text:
@@ -601,6 +685,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             fmt = "wav" if data.get("format") == "wav" else "ogg"
             audio = _synth(text, data.get("voice"), temperature, speed, pitch, fmt)
+        except NeedVoice as e:
+            self._json(409, {"error": "voice not here yet", "need": str(e)})
+            return
         except ValueError as e:  # voice/transcript problems — user-fixable
             logger.error(str(e))
             self._json(400, {"error": str(e)})
@@ -615,6 +702,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(audio)
 
+    def _still_there(self):
+        """The caller sends nothing after its request: a readable socket now is
+        its close (a FIN, or TLS's close_notify). A write would only fail a
+        group or two later, each one GPU seconds made for nobody."""
+        try:
+            return not select.select([self.connection], [], [], 0)[0]
+        except (OSError, ValueError):
+            return False
+
     def _stream(self, text, voice, temperature, speed, pitch, pieces=False):
         """One complete OGG per segment (a pause-cut piece of a group on the
         fast engine, else a whole group), written the moment it's made
@@ -623,7 +719,10 @@ class Handler(BaseHTTPRequestHandler):
         requests' iter_content wait for the END before yielding anything.
         A failure after the 200 can only end the body early."""
         try:
-            groups = _render(text, voice, temperature, speed, pitch, stream=pieces)
+            groups = _render(text, voice, temperature, speed, pitch, stream=pieces, wanted=self._still_there)
+        except NeedVoice as e:
+            self._json(409, {"error": "voice not here yet", "need": str(e)})
+            return
         except ValueError as e:
             logger.error(str(e))
             self._json(400, {"error": str(e)})
@@ -643,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(ogg), ogg))
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, TimeoutError, ssl.SSLError):   # Windows: ConnectionAbortedError; TLS: SSLEOFError
             logger.info("stream client went away")       # a Stop: the pump closed it
         except Exception as e:
             logger.error(f"stream synthesis failed: {e!r}")
@@ -651,10 +750,91 @@ class Handler(BaseHTTPRequestHandler):
             groups.close()                                 # releases the GPU lock now
 
 
+    def _receive(self, data):
+        """A voice from another computer: {wav: base64, text}. Kept under its
+        hash, which is computed here, so a name can't point at another clip."""
+        try:
+            wav = base64.b64decode(data.get("wav") or "", validate=True)
+        except Exception:
+            wav = b""
+        text = str(data.get("text") or "").strip()
+        if not wav.startswith(b"RIFF") or len(wav) > MAX_VOICE_BYTES or not text:
+            self._json(400, {"error": "a voice needs a WAV clip and its transcript"})
+            return
+        name = voice_hash(wav, text)
+        try:
+            os.makedirs(RECEIVED_DIR, exist_ok=True)
+            for ext, body in ((".txt", text.encode("utf-8")), (".wav", wav)):
+                final = os.path.join(RECEIVED_DIR, f"{name}{ext}")
+                if os.path.isfile(final):        # same name = same bytes: never replace a file a synth may be reading (Windows refuses)
+                    continue
+                tmp = f"{final}.{os.getpid()}-{threading.get_ident()}.tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(body)
+                os.replace(tmp, final)
+        except OSError as e:
+            logger.error(f"could not keep a received voice: {e!r}")
+            self._json(500, {"error": f"the GPU computer could not save the voice: {e}"})
+            return
+
+        def age(f):
+            try:
+                return os.path.getmtime(os.path.join(RECEIVED_DIR, f))
+            except OSError:
+                return 0.0
+        kept = sorted((f for f in os.listdir(RECEIVED_DIR) if f.endswith(".wav")), key=age, reverse=True)
+        for old in kept[RECEIVED_MAX:]:
+            for ext in (".wav", ".txt"):
+                try:
+                    os.remove(os.path.join(RECEIVED_DIR, old[:-4] + ext))
+                except OSError:
+                    pass
+        logger.info(f"received a voice ({len(wav) // 1024} KB), kept as {name[:14]}")
+        self._json(200, {"voice": name})
+
+
+def _open_door():
+    """Run alone (the launchers set share): other computers' Sapphires use this
+    GPU through a TLS door, a key per computer. "sapphire" is let in on the
+    first start and its pairing string printed on every start: the same
+    string until its key is removed or the door's folder is deleted."""
+    global _banner
+    port = int(_START.get("share_port") or 5015)
+    try:
+        if "sapphire" not in worker_door.clients(DOOR):
+            worker_door.add_client(DOOR, "sapphire")
+        line = worker_door.pairing(DOOR, "sapphire", f"{worker_door.guess_host()}:{port}")
+        srv = worker_door.serve(ThreadingHTTPServer, Handler, "0.0.0.0", port, DOOR)
+    except Exception as e:
+        logger.error(f"Shared door not opened on port {port}: {e}")
+        print(f"\nAudio8 could NOT open port {port} for the other computer: {e}\n"
+              "Is Audio8 already running in another window? Close this one.\n", flush=True)
+        raise SystemExit(1)                      # run alone, the door is the whole point: never "ready" without it
+    threading.Thread(target=srv.serve_forever, daemon=True, name="audio8-door").start()
+    bar = "=" * 72
+    _banner = (f"\n{bar}\nAudio8 is shared on port {port}. In Sapphire: Settings > Audio8,\n"
+               f"turn on Client only and paste this pairing string:\n\n{line}\n\n"
+               f"It stays the same on every start. Allow port {port} in the firewall.\n{bar}\n")
+    print(_banner, flush=True)
+
+
 def main():
     os.makedirs(VOICES_DIR, exist_ok=True)
+    if _START.get("share"):
+        _open_door()                             # first: a second copy stops here, before loading a model
+
+    class Local(ThreadingHTTPServer):
+        allow_reuse_address = sys.platform != "win32"     # Windows lets a second copy share a taken port, silently
+    try:
+        srv = Local(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        logger.error(f"port {PORT} on 127.0.0.1 is taken: {e}")
+        if _START.get("share"):
+            print(f"\nAudio8 could NOT start: port {PORT} on this computer is taken, most likely by\n"
+                  "Sapphire's own Audio8 here. In Sapphire: Settings > Audio8, tick Client only\n"
+                  "(or turn Audio8 off there), then run this again.\n", flush=True)
+        raise SystemExit(1)
     threading.Thread(target=_load_model, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     logger.info(f"Audio8 server on 127.0.0.1:{PORT}, voices in {VOICES_DIR}")
     srv.serve_forever()
 

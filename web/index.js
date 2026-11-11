@@ -74,7 +74,7 @@ async function watchStatus(box) {
     const me = box._a8watch = {};             // a re-render starts a new watch; this one bows out
     while (box.isConnected && box._a8watch === me) {
         let st;
-        try { st = await api('/api/plugin/audio8/status', {}, 5000); }
+        try { st = await api('/api/plugin/audio8/status', {}, 15000); }   // a GPU computer that's off takes the route 5-10 s to say so
         catch { st = { status: 'down', phase: 'No answer from Sapphire' }; }
         ready = st.status === 'ready';
         applyReady(box);
@@ -85,11 +85,14 @@ async function watchStatus(box) {
         }
         const p = st.progress, bar = el.querySelector('progress');
         el.classList.toggle('err', st.status === 'error');
+        const far = st.client === true, down = st.status === 'down';
         el.querySelector('.a8-name').textContent = st.status === 'error'
-            ? 'Audio8 failed to start' : 'Audio8 is starting';
+            ? (far ? 'Audio8 on the other computer failed to start' : 'Audio8 failed to start')
+            : far && down ? "Audio8 on the other computer isn't answering"
+            : far ? 'Audio8 on the other computer is starting' : 'Audio8 is starting';
         el.querySelector('.a8-hint').textContent = st.status === 'error'
-            ? `${st.error || 'see user/logs/audio8-audio8-server.log'}`
-            : `${st.phase || 'Starting'}${p?.total ? ` - ${(p.done / 1e9).toFixed(2)} of ${(p.total / 1e9).toFixed(2)} GB` : ''}. Speak and Try turn on when it is ready.`;
+            ? `${st.error || (far ? 'see its window on that computer' : 'see user/logs/audio8-audio8-server.log')}`
+            : `${st.phase || 'Starting'}${p?.total ? ` - ${(p.done / 1e9).toFixed(2)} of ${(p.total / 1e9).toFixed(2)} GB` : ''}${far && down ? '' : '. Speak and Try turn on when it is ready.'}`;
         bar.hidden = !p?.total;
         if (p?.total) { bar.max = p.total; bar.value = p.done; }
         await new Promise(r => setTimeout(r, st.status === 'error' ? 5000 : 1500));
@@ -118,7 +121,13 @@ function renderGeneral(box, settings) {
         <div class="a8-field">
             <label><input type="checkbox" id="a8-pieces" ${settings.pieces === true ? 'checked' : ''}> Stream in pieces (experimental)</label>
             <div class="a8-hint">Off is recommended. On sends speech in short pieces as it's made: first words come sooner, but it costs more GPU time and adds small gaps between pieces.</div>
+        </div>
+        <div class="a8-field">
+            <label><input type="checkbox" id="a8-client" ${settings.client === true ? 'checked' : ''}> Client only: use Audio8 on another computer</label>
+            <input type="text" id="a8-worker" placeholder="https://host:5015/#key=...&pin=..." autocomplete="off" spellcheck="false">
+            <div class="a8-hint">On the GPU computer run <code>audio8-server.bat</code> (Windows) or <code>audio8-server.sh</code> (Linux) from this plugin's folder, then paste the pairing string it prints. Nothing downloads here and this computer's server stops. Your voices are sent there once each, the first time they're used.</div>
         </div>`;
+    g.querySelector('#a8-worker').value = settings.worker || '';
     g.dataset.voice = settings.voice || 'sapphire';
 }
 
@@ -484,6 +493,8 @@ export default {
                     temperature: num('#a8-temp', 0.8),
                     port: Math.round(num('#a8-port', 5014)),
                     pieces: container.querySelector('#a8-pieces').checked,
+                    client: container.querySelector('#a8-client').checked,
+                    worker: container.querySelector('#a8-worker').value.trim(),
                 };
             },
         });

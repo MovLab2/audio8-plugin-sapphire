@@ -244,14 +244,32 @@ def _num(value, lo, hi):
 
 def server_status(settings=None, **_):
     """The model server's /health for the page: status, phase, progress, error.
-    status "down" = no answer (plugin off, or the process starting)."""
-    from core import net
+    status "down" = no answer (plugin off, the process starting, or with
+    Client only on, the other computer not answering)."""
+    from plugins.audio8 import link
+    s = settings or {}
+    client = link.client_on(s)
+    down = {"status": "down", "progress": None, "error": None, "client": client}
+    if not client:
+        blocked = ((_pl.plugin_loader.get_plugin_info("audio8") or {}).get("services_blocked"))
+        if blocked and blocked != "client":
+            why = {"missing": "Audio8's environment isn't built: Settings > Plugins > Audio8, Build. "
+                              "Or tick Client only to use Audio8 on another computer."}.get(
+                blocked, f"Audio8's server can't start here (environment {blocked}): see Settings > Plugins > Audio8")
+            return {**down, "phase": why}
     try:
-        port = int((settings or {}).get("port") or 5014)
-        h = net.get(f"http://127.0.0.1:{port}/health", timeout=2).json()
-    except Exception:
-        return {"status": "down", "phase": "Starting the server", "progress": None, "error": None}
-    return {k: h.get(k) for k in ("status", "phase", "progress", "error")}
+        r = link.call("get", "/health", s, timeout=(5, 5) if client else 2)
+    except Exception as e:
+        return {**down, "phase": link.words(e) if client else "Starting the server"}
+    if r.status_code == 401:
+        return {**down, "phase": link.REFUSED}
+    try:
+        h = r.json() if r.status_code == 200 else {}
+    except ValueError:
+        h = {}
+    if not h:
+        return {**down, "phase": f"The Audio8 server answered HTTP {r.status_code}"}
+    return {**{k: h.get(k) for k in ("status", "phase", "progress", "error")}, "client": client}
 
 
 def try_voice(name, body=None, settings=None, **_):
@@ -259,34 +277,39 @@ def try_voice(name, body=None, settings=None, **_):
     no text = a stock test line; format "mp3" = a file to download and share,
     else OGG for a quick listen."""
     from fastapi.responses import Response
-    from core import net
+    from plugins.audio8 import link
     body = body or {}
     wav, _b = _find(name)
     if not wav:
         return {"error": "No such voice."}, 404
     try:
-        port = int((settings or {}).get("port") or 5014)
         temperature = float((settings or {}).get("temperature") or 0.8)
     except (TypeError, ValueError):
-        port, temperature = 5014, 0.8
+        temperature = 0.8
     text = " ".join(str(body.get("text") or "").split())
     if len(text) > MAX_SAMPLE_CHARS:
         return {"error": f"Keep it under {MAX_SAMPLE_CHARS} characters."}, 400
     mp3 = body.get("format") == "mp3"
     try:
-        r = net.post(f"http://127.0.0.1:{port}/tts", timeout=300,
-                     json={"text": text or TRY_TEXT, "voice": name, "temperature": temperature,
-                           "speed": _num(body.get("speed", 1.0), 0.75, 1.6),
-                           "pitch": _num(body.get("pitch", 1.0), 0.5, 2.0),
-                           "format": "wav" if mp3 else "ogg"})
-    except Exception:
+        r = link.tts("/tts", {"text": text or TRY_TEXT, "voice": name, "temperature": temperature,
+                              "speed": _num(body.get("speed", 1.0), 0.75, 1.6),
+                              "pitch": _num(body.get("pitch", 1.0), 0.5, 2.0),
+                              "format": "wav" if mp3 else "ogg"}, settings or None, timeout=(5, 300))
+    except Exception as e:
+        if link.client_on(settings or None):
+            return {"error": f"Audio8 on the other computer: {link.words(e)}"}, 503
         return {"error": "The Audio8 server isn't answering. Is the plugin on and loaded?"}, 503
     if r.status_code != 200:
-        try:
-            words = r.json().get("error")
-        except Exception:
-            words = r.text
-        return {"error": str(words or "The Audio8 server refused.")[:300]}, r.status_code
+        if r.status_code == 401:
+            words = link.REFUSED
+        else:
+            try:
+                words = r.json().get("error")
+            except Exception:
+                words = r.text
+        # The worker's own codes stay there: a 401 here would read as Sapphire's login expiring.
+        code = 502 if link.client_on(settings or None) and r.status_code not in (400, 503) else r.status_code
+        return {"error": str(words or "The Audio8 server refused.")[:300]}, code
     if mp3:
         return Response(_mp3(r.content), media_type="audio/mpeg")
     return Response(r.content, media_type="audio/ogg")

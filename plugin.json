@@ -1,7 +1,7 @@
 {
   "name": "audio8",
   "short_display_name": "Audio8",
-  "version": "0.8.2",
+  "version": "0.9.1",
   "description": "Audio8 TTS (unofficial) — 44.1kHz zero-shot voice cloning, runs on GPU in its own conda env",
   "author": "sapphire",
   "icon": "🎙️",
@@ -17,8 +17,10 @@
       "transformers>=4.57,<5",
       "soundfile>=0.12",
       "safetensors>=0.4",
-      "pedalboard==0.9.26"
-    ]
+      "pedalboard==0.9.26",
+      "triton-windows>=3.6,<3.7; sys_platform == \"win32\""
+    ],
+    "client": {"setting": "client", "label": "Client only", "help": "use an Audio8 server on another computer; nothing downloads here"}
   },
   "settingsUI": "plugin",
   "capabilities": {
@@ -79,6 +81,20 @@
         "label": "Stream in pieces (experimental)",
         "default": false,
         "help": "Off (recommended): each sentence group comes whole. On: speech is sent in short pieces as it's made, so the first words come sooner, but it costs more GPU time and adds small gaps between pieces."
+      },
+      {
+        "key": "client",
+        "type": "boolean",
+        "label": "Client only",
+        "default": false,
+        "help": "Use an Audio8 server on another computer instead of this one: no environment, no model, no GPU here. Saving starts or stops this computer's server."
+      },
+      {
+        "key": "worker",
+        "type": "string",
+        "label": "Pairing string from the GPU computer",
+        "default": "",
+        "help": "On that computer run audio8-server.bat (Windows) or audio8-server.sh (Linux) and copy the pairing string it prints. Your voices are sent there once each, the first time they're used."
       }
     ]
   }

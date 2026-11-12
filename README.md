@@ -1,6 +1,6 @@
 # Audio8 TTS
 
-Zero-shot voice-cloning TTS at 44.1kHz — Audio8-TTS-Realistic-Air (601M DualAR, 23 languages, Apache-2.0), pinned to a commit sha. A finetune of Audio8-TTS-Preview-0.6b with more natural prosody; same architecture and code. ~1.2GB VRAM, ~11× realtime on an RTX 5090 with the built-in fast engine (~2× on the model's own loop).
+Zero-shot voice-cloning TTS at 44.1kHz — [Audio8-TTS-Realistic-Air](https://huggingface.co/Edge0/Audio8-TTS-Realistic-Air) (601M DualAR, 23 languages, Apache-2.0), pinned to a commit sha. A finetune of Audio8-TTS-Preview-0.6b with more natural prosody; same architecture and code. ~1.2GB VRAM, ~11× realtime on an RTX 5090 with the built-in fast engine (~2× on the model's own loop).
 
 ## How it runs
 
@@ -42,18 +42,20 @@ Run the voice on a second computer's graphics card, so Sapphire's computer keeps
 
   4. Type these two lines, pressing Enter after each:
 
-        cd C:\audio8
-    audio8-server.bat
+     ```
+     cd C:\audio8
+     audio8-server.bat
+     ```
 
-The first time takes a while: it downloads about 7 GB and sets itself up. If Windows asks whether Python may use the network, tick **Private networks** and click **Allow** (it asks again after the first run builds its own Python, even if FlashHead was allowed before).
+     The first time takes a while: it downloads about 7 GB and sets itself up. If Windows asks whether Python may use the network, tick **Private networks** and click **Allow** (it asks again after the first run builds its own Python, even if FlashHead was allowed before).
 
-  5. A box appears with a long line starting `https://`. That's the pairing string: select it and copy it (it's the same every time, so you only paste it once). When the window says **Model ready** , Audio8 is ready.
+  5. A box appears with a long line starting `https://`. That's the pairing string: select it and copy it (it's the same every time, so you only paste it once). When the window says **Model ready**, Audio8 is ready.
 
   6. Leave that window open. Closing it turns Audio8 off.
 
 **In Sapphire (once):**
 
-  7. Settings > Audio8: tick **Client only** , paste the pairing string into the box under it, and click **Save**.
+  7. Settings > Audio8: tick **Client only**, paste the pairing string into the box under it, and click **Save**.
 
 That's it. Sapphire now speaks with the other computer's graphics card. Your voices stay on Sapphire's computer and are sent over by themselves the first time each one is used.
 
@@ -61,7 +63,7 @@ That's it. Sapphire now speaks with the other computer's graphics card. Your voi
 
   * Check that the window from step 6 is still open and says Model ready.
   * If the second computer got a new network address (after a router restart, say), the pairing string changes: copy the new one from the window and paste it in again (step 7).
-  * "No answer in time" usually means the firewall. On the second computer, open **Windows Security > Firewall & network protection > Allow an app through firewall**, find **python** and tick **Private**. Also check that your home network is set to **Private** , not Public (Settings > Network & internet > your connection).
+  * "No answer in time" usually means the firewall. On the second computer, open **Windows Security > Firewall & network protection > Allow an app through firewall**, find **python** and tick **Private**. Also check that your home network is set to **Private**, not Public (Settings > Network & internet > your connection).
   * If the window says it could NOT open the port, Audio8 is already running in another window: use that one.
 
 On Linux, step 4 is `./audio8-server.sh` in a terminal. To stop using the other computer, untick Client only and Save.
@@ -183,7 +185,7 @@ REM Convenience launcher for the Audio8 standalone server.
 REM Calls the developer's audio8-server.bat.
 call "%USERPROFILE%\miniconda3\Scripts\activate.bat"
 cd /d C:\audio8
-audio8-server.bat
+call audio8-server.bat
 pause
 ```
 

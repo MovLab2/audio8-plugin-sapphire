@@ -2,7 +2,7 @@
   "plugin": "audio8",
   "version": "0.9.1",
   "files": {
-    "README.md": "sha256:7a35c89706007bc92a35a14a24c28ad87700d3b2a5a05bed7608045ed43a743d",
+    "README.md": "sha256:fb18f77b5b0dec9fbf67b3a9ba79dbe42c2e5b96f71aaf98bc30741d0ca44482",
     "fastgen.py": "sha256:277c1141af654e27afdbac481e448dafd8dfe0ffb988081fdbd91a6e81f9833f",
     "link.py": "sha256:b4242e05af069fc7e6830aa6e471129cfc256db2ab62ae13be823e883dcd17e5",
     "plugin.json": "sha256:229e6b8aba5d683352e58c2303c2826025934d0a49ee31df6f3fce734f3ab476",
@@ -13,5 +13,5 @@
     "web/index.js": "sha256:16e0e133ac7b2c52b176d78aa4b03031f23c9fe9b5b80378b66bdb5ebd2c8dd2",
     "worker_door.py": "sha256:3dfc5dfa26261d3e26b9f10141b2ae9e52aa79d61c26ff85b7e0f8ae9d225bd8"
   },
-  "signature": "VIXHE9ZgSlF3Gz/cYvMRbJxlFPLwe1SBnCqrzLAdgGEe/x2/r03hphKQng72W1LnRb+BZ3qq7t6zjMeFjFXUAQ=="
+  "signature": "gsUPWz01QX4+Ecx7ioRIPjLWeu1/Rv69MIPSuUkU7bUqg9ynTuPUWYnjiXS/WHHZfFv909kf74eUdg8DeOY6Dw=="
 }
